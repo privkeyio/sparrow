@@ -4,6 +4,7 @@ import com.github.arteam.simplejsonrpc.client.Transport;
 import com.sparrowwallet.drongo.Network;
 import com.sparrowwallet.sparrow.AppServices;
 import com.sparrowwallet.sparrow.io.Server;
+import com.sparrowwallet.sparrow.io.Storage;
 import com.sparrowwallet.sparrow.net.Protocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +15,10 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.KeyStore;
+import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Base64;
 
@@ -57,9 +61,10 @@ public class BitcoindTransport implements Transport {
         HttpURLConnection connection = proxy != null && Protocol.isOnionAddress(bitcoindServer) ? (HttpURLConnection)bitcoindUrl.openConnection(proxy) : (HttpURLConnection)bitcoindUrl.openConnection();
 
         if(connection instanceof HttpsURLConnection httpsURLConnection) {
-            SSLSocketFactory sslSocketFactory = getTrustAllSocketFactory();
+            SSLSocketFactory sslSocketFactory = getSslSocketFactory();
             if(sslSocketFactory != null) {
                 httpsURLConnection.setSSLSocketFactory(sslSocketFactory);
+                httpsURLConnection.setHostnameVerifier((hostname, session) -> true);
             }
         }
 
@@ -138,26 +143,49 @@ public class BitcoindTransport implements Transport {
         return bitcoindDir;
     }
 
-    private SSLSocketFactory getTrustAllSocketFactory() {
-        TrustManager[] trustAllCerts = new TrustManager[] {
-            new X509TrustManager() {
-                public X509Certificate[] getAcceptedIssuers() {
-                    return new X509Certificate[0];
-                }
-
-                public void checkClientTrusted(X509Certificate[] certs, String authType) throws CertificateException {
-                }
-
-                public void checkServerTrusted(X509Certificate[] certs, String authType) throws CertificateException {
-                }
-            }
-        };
-
+    private SSLSocketFactory getSslSocketFactory() {
         try {
+            String host = bitcoindServer.getHost();
+            File crtFile = Storage.getCertificateFile(host);
+
+            if(crtFile != null) {
+                Certificate certificate = CertificateFactory.getInstance("X.509").generateCertificate(new FileInputStream(crtFile));
+                KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+                keyStore.load(null, null);
+                keyStore.setCertificateEntry("bitcoind-rpc", certificate);
+
+                TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+                tmf.init(keyStore);
+
+                SSLContext sslContext = SSLContext.getInstance("TLS");
+                sslContext.init(null, tmf.getTrustManagers(), null);
+                return sslContext.getSocketFactory();
+            }
+
+            TrustManager[] tofuTrustManagers = new TrustManager[] {
+                new X509TrustManager() {
+                    public X509Certificate[] getAcceptedIssuers() {
+                        return new X509Certificate[0];
+                    }
+
+                    public void checkClientTrusted(X509Certificate[] certs, String authType) throws CertificateException {
+                    }
+
+                    public void checkServerTrusted(X509Certificate[] certs, String authType) throws CertificateException {
+                        if(certs.length == 0) {
+                            throw new CertificateException("No server certificate provided");
+                        }
+                        certs[0].checkValidity();
+                        Storage.saveCertificate(host, certs[0]);
+                        log.info("Saved Bitcoin Core RPC certificate for " + host);
+                    }
+                }
+            };
+
             SSLContext sslContext = SSLContext.getInstance("TLS");
-            sslContext.init(null, trustAllCerts, null);
+            sslContext.init(null, tofuTrustManagers, null);
             return sslContext.getSocketFactory();
-        } catch (Exception e) {
+        } catch(Exception e) {
             log.error("Error creating SSL socket factory", e);
         }
 
